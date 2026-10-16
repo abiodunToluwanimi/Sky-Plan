@@ -9,12 +9,10 @@ import 'package:sky_plan/services/location_service.dart';
 
 part 'weather_provider.g.dart';
 
-// This generates a NotifierProvider named 'weatherProvider'
 @riverpod
 class Weather extends _$Weather {
   @override
   WeatherData build() {
-    // Initial default state before the first live fetch completes.
     return const WeatherData(
       condition: 'Loading…',
       temperature: 25.0,
@@ -32,11 +30,18 @@ class Weather extends _$Weather {
     state = state.copyWith(endHour: hour, endMin: min);
   }
 
-  /// Gets the device's current location, then pulls live conditions for it
-  /// from Open-Meteo (no API key needed).
+  void clearSelectedTimes() {
+    state = state.copyWith(
+      startHour: null,
+      startMin: null,
+      endHour: null,
+      endMin: null,
+    );
+  }
+
+  /// Gets the device location, then pulls current conditions from Open-Meteo.
   Future<void> fetchLiveWeather() async {
     final position = await getCurrentPosition();
-
     final uri = Uri.https('api.open-meteo.com', '/v1/forecast', {
       'latitude': '${position.latitude}',
       'longitude': '${position.longitude}',

@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:sky_plan/provider/plan_advice_provider.dart';
 import 'package:sky_plan/provider/weather_provider.dart';
 
+// ignore: must_be_immutable
 class SkyPlan extends ConsumerStatefulWidget {
   final String selectedButton;
   bool showContainer = false;
