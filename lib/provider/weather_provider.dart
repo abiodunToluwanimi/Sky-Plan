@@ -39,16 +39,39 @@ class Weather extends _$Weather {
     );
   }
 
-  /// Gets the device location, then pulls current conditions from Open-Meteo.
-  Future<void> fetchLiveWeather() async {
-    final position = await getCurrentPosition();
+  /// Gets current conditions from Open-Meteo.
+  ///
+  /// If coordinates are provided, it uses those exact coordinates. This lets
+  /// the screen share one GPS fix between its location label and weather data.
+  /// If omitted, it preserves the original behavior and gets device location
+  /// using the project's location service.
+  Future<void> fetchLiveWeather({double? latitude, double? longitude}) async {
+    if ((latitude == null) != (longitude == null)) {
+      throw ArgumentError('Pass both latitude and longitude, or neither.');
+    }
+
+    late final double requestLatitude;
+    late final double requestLongitude;
+
+    if (latitude != null && longitude != null) {
+      requestLatitude = latitude;
+      requestLongitude = longitude;
+    } else {
+      final location = await LocationService.getCurrentLocation();
+      requestLatitude = location.latitude;
+      requestLongitude = location.longitude;
+    }
+
     final uri = Uri.https('api.open-meteo.com', '/v1/forecast', {
-      'latitude': '${position.latitude}',
-      'longitude': '${position.longitude}',
+      'latitude': '$requestLatitude',
+      'longitude': '$requestLongitude',
       'current': 'temperature_2m,relative_humidity_2m,weather_code,is_day',
     });
 
-    final response = await http.get(uri);
+    final response = await http.get(uri).timeout(
+      const Duration(seconds: 20),
+    );
+
     if (response.statusCode != 200) {
       throw Exception(
         'Open-Meteo request failed with status ${response.statusCode}',
@@ -57,7 +80,7 @@ class Weather extends _$Weather {
 
     final body = jsonDecode(response.body) as Map<String, dynamic>;
     final current = body['current'] as Map<String, dynamic>;
-    final code = current['weather_code'] as int;
+    final code = (current['weather_code'] as num).toInt();
 
     state = state.copyWith(
       temperature: (current['temperature_2m'] as num).toDouble(),

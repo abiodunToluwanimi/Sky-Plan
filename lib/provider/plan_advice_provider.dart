@@ -5,13 +5,21 @@ import 'package:sky_plan/services/forecast_service.dart';
 part 'plan_advice_provider.g.dart';
 
 const _systemPrompt = '''
-You are a weather-planning assistant inside a mobile app.
-Reply in plain friendly simple text only (no markdown, no asterisks, no headings), under 90 words.
-Start with one verdict line beginning with ✅ (good), ⚠️ (risky) or ❌ (not suitable).
-Then give short emoji-led lines covering the main weather issues, practical steps,
-and a better time only if there is a significantly better one.
-Respect the user's actual activity and timing. Do not claim weather details that
-are not supported by the supplied forecast.
+You're a friendly weather buddy inside a mobile app, like a friend who just checked the forecast for them.
+Reply in plain text only (no markdown, no asterisks, no headings), under 80 words.
+
+First, answer exactly what the user asked:
+- Sun or heat question: give the feels-like temperature and UV level first.
+- Rain question: say how heavy it will be (use the mm and the light/moderate/heavy label, not just the chance), and when it peaks.
+- "Can I go?" question: open with ✅, ⚠️ or ❌ and one short friendly sentence.
+
+Then add only the tips that matter for their activity: what to bring or wear, and a better time only if it is clearly better. Mention wind only if it is strong (over 30 km/h) or relevant.
+Use the real numbers from the forecast instead of vague words.
+For short activities (like a 30 minute walk), judge only the part of the hour that overlaps with the activity.
+If the user is leaving later (like "class in 2 hours"), tell them what it will be like at that time, and mention the trip there if it matters.
+Match the user's tone. If they write casually, be casual.
+If forecast values seem to conflict (e.g. drizzle but 0 mm), say it simply, like "maybe a light sprinkle, nothing serious".
+Use at most 2 or 3 emojis. Never mention anything that is not in the forecast.
 ''';
 
 @riverpod
@@ -57,23 +65,35 @@ class PlanAdvice extends _$PlanAdvice {
             'The user selected ${_fmt(startHour, startMinute)} to '
             '${_fmt(endHour, endMinute)} $day. Use this selected clock range.';
       } else {
-        // The task may contain a duration such as "2 hours 30 mins".
-        // If it doesn't, make a near-term recommendation using the next 3 hours.
-        final userDuration = _durationFromTask(task);
-        final forecastDuration = userDuration == null
-            ? 180
-            : userDuration.clamp(1, 24 * 60).toInt();
+        // The task text may say "for 2 hours 30 mins" (a duration) or
+        // "in 2 hours" (a start time). Handle both.
+        final timing = _timingFromTask(task);
+        final startOffset = timing.startOffsetMinutes;
+        final duration = (timing.durationMinutes ?? (startOffset > 0 ? 60 : 180))
+            .clamp(1, 24 * 60)
+            .toInt();
 
         forecast = await fetchNextForecastWindow(
-          durationMinutes: forecastDuration,
+          durationMinutes: duration,
+          startOffsetMinutes: startOffset,
         );
+        final label = forecast.windowLabel ?? '';
 
-        timingDescription = userDuration == null
-            ? 'No clock time or clear duration was selected. Assume the user is '
-                'starting soon and assess the next 3 hours.'
-            : 'The task text suggests a duration of ${_formatDuration(userDuration)}. '
-                'Assume the activity starts soon. The supplied forecast covers '
-                'up to the next 24 hours.';
+        if (startOffset > 0) {
+          timingDescription =
+              'The user needs to be out in ${_formatDuration(startOffset)} '
+              '($label). Focus on the weather at that time, and mention the '
+              'conditions between now and then if they matter (the table may '
+              'include those earlier hours).';
+        } else if (timing.durationMinutes != null) {
+          timingDescription =
+              'The activity starts now and lasts ${_formatDuration(duration)} '
+              '($label).';
+        } else {
+          timingDescription =
+              'No clock time or clear duration was given. Assume the user is '
+              'starting now and assess the next 3 hours ($label).';
+        }
       }
 
       if (forecast.hours.isEmpty) {
@@ -82,19 +102,56 @@ class PlanAdvice extends _$PlanAdvice {
 
       final table = forecast.hours.map((h) => h.toPromptLine()).join('\n');
       final prompt = '''
-The user's activity, in their own words: $task
+The user's message, in their own words: $task
 Timing: $timingDescription
 Hourly forecast for the relevant period:
 $table
 
-Assess whether this specific activity is suitable in these weather conditions.
-If the user gave a duration in their message, keep it in mind even when no manual
-clock-time range was selected. Be practical and specific.
+Answer the user's actual question first (heat/sun, how heavy the rain, or whether
+they can go), then give practical tips. Respect the timing above.
 ''';
 
       return askAi(system: _systemPrompt, prompt: prompt);
     });
   }
+}
+
+typedef _Timing = ({int startOffsetMinutes, int? durationMinutes});
+
+/// Splits the task text into "when it starts" and "how long it lasts".
+/// "class in 2hrs" -> starts in 120 minutes.
+/// "walk for 30 mins" -> lasts 30 minutes, starts now.
+_Timing _timingFromTask(String task) {
+  var text = task.toLowerCase();
+  var startOffset = 0;
+
+  final startPattern = RegExp(
+    r'\bin\s+(?:(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?)'
+    r'|(an hour|half an hour|a couple of hours|a few minutes))\b',
+  );
+  final match = startPattern.firstMatch(text);
+
+  if (match != null) {
+    if (match.group(1) != null) {
+      final value = double.parse(match.group(1)!);
+      final unit = match.group(2)!;
+      startOffset = unit.startsWith('h') ? (value * 60).round() : value.round();
+    } else {
+      startOffset = switch (match.group(3)) {
+        'an hour' => 60,
+        'half an hour' => 30,
+        'a couple of hours' => 120,
+        _ => 15,
+      };
+    }
+    // Remove it so "in 2 hrs" is not also counted as a 2 hour duration.
+    text = text.replaceRange(match.start, match.end, ' ');
+  }
+
+  return (
+    startOffsetMinutes: startOffset.clamp(0, 24 * 60).toInt(),
+    durationMinutes: _durationFromTask(text),
+  );
 }
 
 int? _durationFromTask(String task) {

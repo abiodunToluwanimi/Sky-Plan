@@ -3,6 +3,8 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_weather_bg/flutter_weather_bg.dart';
+import 'package:geocoding/geocoding.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:sky_plan/model/weather_type_mapper.dart';
 import 'package:sky_plan/provider/plan_advice_provider.dart';
 import 'package:sky_plan/provider/weather_provider.dart';
@@ -39,9 +41,16 @@ class HomePage extends ConsumerStatefulWidget {
 class _HomePageState extends ConsumerState<HomePage> {
   late final ScrollController _scrollController;
   final TextEditingController _customTaskController = TextEditingController();
+  final Geocoding _geocoding = Geocoding();
+
+  static const double _expandedHeaderHeight = 370.0;
+  static const double _maxScrollToFade =
+      _expandedHeaderHeight - kToolbarHeight;
+  static const Color _blendColor = Color.fromARGB(255, 96, 77, 126);
 
   double _overlayOpacity = 0.0;
-  final double _maxScrollToFade = 300.0;
+  String _currentLocation = 'Finding location...';
+  bool _isRefreshing = false;
 
   String selectedButton = '';
   bool showContainer = false;
@@ -56,17 +65,120 @@ class _HomePageState extends ConsumerState<HomePage> {
     _scrollController = ScrollController()..addListener(_onScroll);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      ref.read(weatherProvider.notifier).fetchLiveWeather().catchError((error) {
-        debugPrint('fetchLiveWeather failed: $error');
-      });
+      if (mounted) {
+        _refreshWeatherAndLocation(showErrors: false);
+      }
     });
   }
 
   void _onScroll() {
-    final newOpacity =
-        (_scrollController.offset / _maxScrollToFade).clamp(0.0, 1.0);
-    if (newOpacity != _overlayOpacity) {
+    if (!_scrollController.hasClients) return;
+
+    final newOpacity = (_scrollController.offset / _maxScrollToFade)
+        .clamp(0.0, 1.0)
+        .toDouble();
+
+    if ((newOpacity - _overlayOpacity).abs() > 0.005) {
       setState(() => _overlayOpacity = newOpacity);
+    }
+  }
+
+  Future<String> _getCurrentLocationName() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      throw Exception('Turn on your phone location services and try again.');
+    }
+
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      throw Exception(
+        'Allow Sky Plan to access your location in your phone settings.',
+      );
+    }
+
+    final position = await Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        timeLimit: Duration(seconds: 20),
+      ),
+    );
+
+    try {
+      final placemarks = await _geocoding.placemarkFromCoordinates(
+        position.latitude,
+        position.longitude,
+      );
+
+      if (placemarks.isNotEmpty) {
+        final place = placemarks.first;
+        // Prefer a district/LGA name when available, then the city or area.
+        final candidates = <String?>[
+          place.subAdministrativeArea,
+          place.locality,
+          place.subLocality,
+          place.administrativeArea,
+        ];
+
+        for (final candidate in candidates) {
+          if (candidate != null && candidate.trim().isNotEmpty) {
+            return candidate.trim();
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint('Reverse geocoding failed: $error');
+    }
+
+    return 'Current location';
+  }
+
+  Future<void> _refreshWeatherAndLocation({bool showErrors = true}) async {
+    if (_isRefreshing) return;
+
+    setState(() => _isRefreshing = true);
+
+    String? locationError;
+    String? weatherError;
+
+    try {
+      final locationName = await _getCurrentLocationName();
+      if (mounted) {
+        setState(() => _currentLocation = locationName);
+      }
+    } catch (error) {
+      locationError = error.toString().replaceFirst('Exception: ', '');
+      debugPrint('Location refresh failed: $error');
+      if (mounted) {
+        setState(() => _currentLocation = 'Location unavailable');
+      }
+    }
+
+    // Keep the existing provider method intact. This refreshes weather using
+    // the location logic already implemented in weather_provider.dart.
+    try {
+      await ref.read(weatherProvider.notifier).fetchLiveWeather();
+    } catch (error) {
+      weatherError = error.toString().replaceFirst('Exception: ', '');
+      debugPrint('Weather refresh failed: $error');
+    } finally {
+      if (mounted) {
+        setState(() => _isRefreshing = false);
+      }
+    }
+
+    if (showErrors && mounted &&
+        (locationError != null || weatherError != null)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(locationError ?? weatherError ?? 'Refresh failed.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
     }
   }
 
@@ -151,8 +263,10 @@ class _HomePageState extends ConsumerState<HomePage> {
                     ListTile(
                       contentPadding: EdgeInsets.zero,
                       leading: const Icon(Icons.play_arrow, color: Colors.white),
-                      title: const Text('Start time',
-                          style: TextStyle(color: Colors.white)),
+                      title: const Text(
+                        'Start time',
+                        style: TextStyle(color: Colors.white),
+                      ),
                       trailing: Text(
                         draftStart?.format(sheetContext) ?? 'Choose',
                         style: const TextStyle(color: Colors.white70),
@@ -169,9 +283,14 @@ class _HomePageState extends ConsumerState<HomePage> {
                     ),
                     ListTile(
                       contentPadding: EdgeInsets.zero,
-                      leading: const Icon(Icons.flag_outlined, color: Colors.white),
-                      title: const Text('End time',
-                          style: TextStyle(color: Colors.white)),
+                      leading: const Icon(
+                        Icons.flag_outlined,
+                        color: Colors.white,
+                      ),
+                      title: const Text(
+                        'End time',
+                        style: TextStyle(color: Colors.white),
+                      ),
                       trailing: Text(
                         draftEnd?.format(sheetContext) ?? 'Choose',
                         style: const TextStyle(color: Colors.white70),
@@ -227,7 +346,9 @@ class _HomePageState extends ConsumerState<HomePage> {
     final task = _customTaskController.text.trim();
     if (task.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Tell Sky Plan what you want to do first.')),
+        const SnackBar(
+          content: Text('Tell Sky Plan what you want to do first.'),
+        ),
       );
       return;
     }
@@ -235,7 +356,9 @@ class _HomePageState extends ConsumerState<HomePage> {
     if ((_customStartTime == null) != (_customEndTime == null)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Choose both a start and end time, or clear the time range.'),
+          content: Text(
+            'Choose both a start and end time, or clear the time range.',
+          ),
         ),
       );
       return;
@@ -376,7 +499,10 @@ class _HomePageState extends ConsumerState<HomePage> {
                   ),
                   error: (error, _) => Text(
                     error.toString().replaceFirst('Exception: ', ''),
-                    style: const TextStyle(color: Color(0xFFFFC4C4), height: 1.4),
+                    style: const TextStyle(
+                      color: Color(0xFFFFC4C4),
+                      height: 1.4,
+                    ),
                   ),
                   data: (text) => Text(
                     text ?? '',
@@ -388,6 +514,106 @@ class _HomePageState extends ConsumerState<HomePage> {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildTinyRefreshIndicator() {
+    if (!_isRefreshing) return const SizedBox.shrink();
+
+    return const SizedBox(
+      width: 13,
+      height: 13,
+      child: CircularProgressIndicator(
+        strokeWidth: 1.8,
+        color: Colors.white,
+      ),
+    );
+  }
+
+  Widget _buildExpandedLocation() {
+    return Row(
+      children: [
+        const Icon(
+          Icons.location_on_outlined,
+          color: Colors.white,
+          size: 17,
+        ),
+        const SizedBox(width: 5),
+        Expanded(
+          child: Text(
+            _currentLocation,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        _buildTinyRefreshIndicator(),
+      ],
+    );
+  }
+
+  Widget _buildExpandedWeather(dynamic weatherData) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          '${weatherData.temperature.round()}°C',
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+            fontSize: 50,
+            height: 1.05,
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+            letterSpacing: -1.5,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          weatherData.condition,
+          textAlign: TextAlign.center,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            fontSize: 18,
+            color: Colors.white,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCompactWeather(dynamic weatherData) {
+    return Row(
+      children: [
+        const Icon(Icons.location_on_outlined, size: 15),
+        const SizedBox(width: 3),
+        Expanded(
+          child: Text(
+            _currentLocation,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        const SizedBox(width: 7),
+        Text(
+          '${weatherData.temperature.round()}°',
+          style: const TextStyle(
+            fontSize: 15,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        const SizedBox(width: 7),
+        _buildTinyRefreshIndicator(),
+      ],
     );
   }
 
@@ -408,130 +634,201 @@ class _HomePageState extends ConsumerState<HomePage> {
       body: Stack(
         children: [
           Positioned.fill(
-            child: WeatherBg(
-              weatherType: weatherTypeFromWmoCode(
-                weatherData.weatherCode,
-                isDay: weatherData.isDay,
+            child: IgnorePointer(
+              child: WeatherBg(
+                weatherType: weatherTypeFromWmoCode(
+                  weatherData.weatherCode,
+                  isDay: weatherData.isDay,
+                ),
+                width: MediaQuery.of(context).size.width,
+                height: MediaQuery.of(context).size.height,
               ),
-              width: MediaQuery.of(context).size.width,
-              height: MediaQuery.of(context).size.height,
             ),
           ),
+
           Positioned.fill(
-            child: Opacity(
-              opacity: _overlayOpacity,
-              child: Container(color: const Color.fromARGB(255, 96, 77, 126)),
+            child: IgnorePointer(
+              child: Opacity(
+                opacity: _overlayOpacity,
+                child: Container(color: _blendColor),
+              ),
             ),
           ),
-          ListView(
-            controller: _scrollController,
-            padding: const EdgeInsets.only(
-              top: 440,
-              left: 20,
-              right: 20,
-              bottom: 40,
-            ),
-            children: [
-              Center(
-                child: Text(
-                  '${weatherData.temperature}°C',
-                  style: const TextStyle(
-                    fontSize: 50,
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
+
+          RefreshIndicator(
+            onRefresh: () => _refreshWeatherAndLocation(),
+            color: Colors.white,
+            backgroundColor: _blendColor,
+            strokeWidth: 2,
+            displacement: 34,
+            child: CustomScrollView(
+              controller: _scrollController,
+              physics: const AlwaysScrollableScrollPhysics(),
+              slivers: [
+                SliverAppBar(
+                  pinned: true,
+                  automaticallyImplyLeading: false,
+                  expandedHeight: _expandedHeaderHeight,
+                  toolbarHeight: kToolbarHeight,
+                  titleSpacing: 16,
+                  title: AnimatedOpacity(
+                    duration: const Duration(milliseconds: 80),
+                    opacity: _overlayOpacity,
+                    child: _buildCompactWeather(weatherData),
                   ),
-                ),
-              ),
-              const SizedBox(height: 10),
-              Center(
-                child: Text(
-                  weatherData.condition,
-                  style: const TextStyle(
-                    fontSize: 20,
-                    color: Colors.white,
-                    fontWeight: FontWeight.w400,
+                  backgroundColor: Color.lerp(
+                    Colors.transparent,
+                    _blendColor,
+                    _overlayOpacity,
                   ),
-                ),
-              ),
-              const SizedBox(height: 40),
-              Row(
-                children: [
-                  const Expanded(
-                    child: Text(
-                      'Going to?',
-                      style: TextStyle(
-                        fontSize: 20,
-                        color: Colors.white,
-                        fontWeight: FontWeight.w500,
+                  foregroundColor: Colors.white,
+                  surfaceTintColor: Colors.transparent,
+                  elevation: _overlayOpacity > 0.95 ? 1 : 0,
+                  flexibleSpace: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [
+                              Colors.transparent,
+                              _blendColor.withValues(
+                                alpha: 0.18 + (_overlayOpacity * 0.82),
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
+                      Positioned(
+                        top: MediaQuery.of(context).padding.top + 14,
+                        left: 20,
+                        right: 20,
+                        child: IgnorePointer(
+                          child: AnimatedOpacity(
+                            duration: const Duration(milliseconds: 80),
+                            opacity: 1 - _overlayOpacity,
+                            child: _buildExpandedLocation(),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        left: 20,
+                        right: 20,
+                        bottom: 28,
+                        child: IgnorePointer(
+                          child: AnimatedOpacity(
+                            duration: const Duration(milliseconds: 80),
+                            opacity: 1 - _overlayOpacity,
+                            child: _buildExpandedWeather(weatherData),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 22, 20, 40),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                'Going to?',
+                                style: TextStyle(
+                                  fontSize: 20,
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ),
+                            if (_isCustomMode ||
+                                selectedButton.isNotEmpty ||
+                                showContainer)
+                              IconButton(
+                                tooltip: 'Reset planner',
+                                onPressed: _resetPlanner,
+                                icon: const Icon(
+                                  Icons.refresh_rounded,
+                                  color: Colors.white,
+                                ),
+                              ),
+                          ],
+                        ),
+                        if (!_isCustomMode) ...[
+                          const SizedBox(height: 8),
+                          GridView.count(
+                            crossAxisCount: 2,
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            crossAxisSpacing: 16,
+                            mainAxisSpacing: 16,
+                            childAspectRatio: 1.2,
+                            children: [
+                              TaskBox(
+                                title: 'Work',
+                                icon: Icons.work_outline,
+                                onTap: () => tappedButton('Work'),
+                              ),
+                              TaskBox(
+                                title: 'Travelling',
+                                icon: Icons.airplanemode_active,
+                                onTap: () => tappedButton('Travelling'),
+                              ),
+                              TaskBox(
+                                title: 'Walk',
+                                icon: Icons.directions_walk,
+                                onTap: () => tappedButton('Walk'),
+                              ),
+                              TaskBox(
+                                title: 'The Gym',
+                                icon: Icons.fitness_center,
+                                onTap: () => tappedButton('The Gym'),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 20),
+                          if (showContainer)
+                            SkyPlan(
+                              selectedButton: selectedButton,
+                              showContainer: showContainer,
+                            ),
+                          const SizedBox(height: 20),
+                          const Text(
+                            'Or describe your own plan',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 14,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                        ] else ...[
+                          const SizedBox(height: 12),
+                          const Text(
+                            'What do you have planned?',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 14,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                        ],
+                        KeyedSubtree(
+                          key: const ValueKey('customTaskComposer'),
+                          child: _buildCustomComposer(advice.isLoading),
+                        ),
+                        if (_isCustomMode) _buildCustomAnswer(advice),
+                      ],
                     ),
                   ),
-                  if (_isCustomMode || selectedButton.isNotEmpty || showContainer)
-                    IconButton(
-                      tooltip: 'Reset planner',
-                      onPressed: _resetPlanner,
-                      icon: const Icon(Icons.refresh_rounded, color: Colors.white),
-                    ),
-                ],
-              ),
-              if (!_isCustomMode) ...[
-                const SizedBox(height: 8),
-                GridView.count(
-                  crossAxisCount: 2,
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  crossAxisSpacing: 16,
-                  mainAxisSpacing: 16,
-                  childAspectRatio: 1.2,
-                  children: [
-                    TaskBox(
-                      title: 'Work',
-                      icon: Icons.work_outline,
-                      onTap: () => tappedButton('Work'),
-                    ),
-                    TaskBox(
-                      title: 'Travelling',
-                      icon: Icons.airplanemode_active,
-                      onTap: () => tappedButton('Travelling'),
-                    ),
-                    TaskBox(
-                      title: 'Walk',
-                      icon: Icons.directions_walk,
-                      onTap: () => tappedButton('Walk'),
-                    ),
-                    TaskBox(
-                      title: 'The Gym',
-                      icon: Icons.fitness_center,
-                      onTap: () => tappedButton('The Gym'),
-                    ),
-                  ],
                 ),
-                const SizedBox(height: 20),
-                if (showContainer)
-                  SkyPlan(
-                    selectedButton: selectedButton,
-                    showContainer: showContainer,
-                  ),
-                const SizedBox(height: 20),
-                const Text(
-                  'Or describe your own plan',
-                  style: TextStyle(color: Colors.white70, fontSize: 14),
-                ),
-                const SizedBox(height: 10),
-              ] else ...[
-                const SizedBox(height: 12),
-                const Text(
-                  'What do you have planned?',
-                  style: TextStyle(color: Colors.white70, fontSize: 14),
-                ),
-                const SizedBox(height: 10),
               ],
-              KeyedSubtree(
-                key: const ValueKey('customTaskComposer'),
-                child: _buildCustomComposer(advice.isLoading),
-              ),
-              if (_isCustomMode) _buildCustomAnswer(advice),
-            ],
+            ),
           ),
         ],
       ),
